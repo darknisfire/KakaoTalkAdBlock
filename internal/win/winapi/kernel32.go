@@ -1,6 +1,7 @@
 package winapi
 
 import (
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -31,7 +32,7 @@ var (
 )
 
 func CreateToolhelp32Snapshot(flags uint32, pid uint32) windows.HWND {
-	handle, _, _ := createToolhelp32Snapshot.Call(uintptr(flags), uintptr(pid))
+	handle, _, _ := syscall.SyscallN(createToolhelp32Snapshot.Addr(), uintptr(flags), uintptr(pid))
 	return windows.HWND(handle)
 }
 
@@ -39,12 +40,13 @@ func CloseHandle(handle windows.HWND) bool {
 	if handle == 0 || handle == InvalidHandleValue {
 		return false
 	}
-	ret, _, _ := closeHandle.Call(uintptr(handle))
+	ret, _, _ := syscall.SyscallN(closeHandle.Addr(), uintptr(handle))
 	return ret != 0
 }
 
 func Process32First(hSnapshot uintptr, pe *ProcessEntry32) bool {
-	ret, _, _ := process32First.Call(
+	ret, _, _ := syscall.SyscallN(
+		process32First.Addr(),
 		hSnapshot,
 		uintptr(unsafe.Pointer(pe)),
 	)
@@ -52,7 +54,9 @@ func Process32First(hSnapshot uintptr, pe *ProcessEntry32) bool {
 }
 
 func Process32Next(hSnapshot uintptr, pe *ProcessEntry32) bool {
-	ret, _, _ := process32Next.Call(
+	count(cProcess32Next)
+	ret, _, _ := syscall.SyscallN(
+		process32Next.Addr(),
 		hSnapshot,
 		uintptr(unsafe.Pointer(pe)),
 	)

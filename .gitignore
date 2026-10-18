@@ -3,3 +3,5 @@
 *.syso
 *.exe
 *.exe~
+.tasks/
+build/

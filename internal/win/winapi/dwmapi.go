@@ -1,6 +1,7 @@
 package winapi
 
 import (
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -30,7 +31,8 @@ func SetDwmBorderMargins(hWnd windows.HWND, bottomCrop int32) bool {
 	if err := dwmSetWindowAttribute.Find(); err != nil {
 		return false
 	}
-	hresult, _, _ := dwmSetWindowAttribute.Call(
+	hresult, _, _ := syscall.SyscallN(
+		dwmSetWindowAttribute.Addr(),
 		uintptr(hWnd),
 		dwmwaBorderMargins,
 		uintptr(unsafe.Pointer(&margins)),
@@ -45,7 +47,8 @@ func SetDwmCornerPreference(hWnd windows.HWND, doNotRound bool) bool {
 	if doNotRound {
 		preference = 1
 	}
-	hresult, _, _ := dwmSetWindowAttribute.Call(
+	hresult, _, _ := syscall.SyscallN(
+		dwmSetWindowAttribute.Addr(),
 		uintptr(hWnd),
 		dwmwaWindowCornerPreference,
 		uintptr(unsafe.Pointer(&preference)),

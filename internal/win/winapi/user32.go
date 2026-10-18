@@ -22,8 +22,6 @@ var (
 	showWindow                   = user32.NewProc("ShowWindow")
 	getParent                    = user32.NewProc("GetParent")
 	setWindowPos                 = user32.NewProc("SetWindowPos")
-	getWindowLongPtr             = user32.NewProc("GetWindowLongPtrW")
-	setWindowLongPtr             = user32.NewProc("SetWindowLongPtrW")
 	getWindowText                = user32.NewProc("GetWindowTextW")
 	getWindowRect                = user32.NewProc("GetWindowRect")
 	getDpiForWindow              = user32.NewProc("GetDpiForWindow")
@@ -41,84 +39,98 @@ var (
 
 var windowStyleIndexArg = uintptr(^uint32(15))
 
+// SyscallN keeps its args on the stack; LazyProc.Call (//go:uintptrescapes) heap-allocates them and any pointed-to buffer.
 func GetClassName(hWnd windows.HWND) string {
-	buff := make([]uint16, 255)
-	_, _, _ = getClassName.Call(uintptr(hWnd), uintptr(unsafe.Pointer(&buff[0])), 255)
-	return syscall.UTF16ToString(buff)
+	count(cGetClassName)
+	var buf [255]uint16
+	syscall.SyscallN(getClassName.Addr(), uintptr(hWnd), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	return syscall.UTF16ToString(buf[:])
 }
 
 func EnumWindows(lpEnumFunc, lParam uintptr) bool {
-	r, _, _ := enumWindows.Call(lpEnumFunc, lParam)
+	count(cEnumWindows)
+	r, _, _ := syscall.SyscallN(enumWindows.Addr(), lpEnumFunc, lParam)
 	return r != 0
 }
 func EnumChildWindows(hWndParent windows.HWND, lpEnumFunc, lParam uintptr) bool {
-	r, _, _ := enumChildWindows.Call(uintptr(hWndParent), lpEnumFunc, lParam)
+	count(cEnumChildWindows)
+	r, _, _ := syscall.SyscallN(enumChildWindows.Addr(), uintptr(hWndParent), lpEnumFunc, lParam)
 	return r != 0
 }
 
 func ShowWindow(hWnd windows.HWND, nCmdShow int32) bool {
-	r, _, _ := showWindow.Call(uintptr(hWnd), uintptr(nCmdShow))
+	count(cShowWindow)
+	r, _, _ := syscall.SyscallN(showWindow.Addr(), uintptr(hWnd), uintptr(nCmdShow))
 	return r != 0
 }
 
 func GetParent(hWnd windows.HWND) windows.HWND {
-	r, _, _ := getParent.Call(uintptr(hWnd))
+	count(cGetParent)
+	r, _, _ := syscall.SyscallN(getParent.Addr(), uintptr(hWnd))
 	return windows.HWND(r)
 }
 
 func SetWindowPos(hWnd, hWndInsertAfter windows.HWND, x, y, cx, cy int32, uFlags uint32) bool {
-	r, _, _ := setWindowPos.Call(uintptr(hWnd), uintptr(hWndInsertAfter), uintptr(x), uintptr(y), uintptr(cx), uintptr(cy), uintptr(uFlags))
+	count(cSetWindowPos)
+	r, _, _ := syscall.SyscallN(setWindowPos.Addr(), uintptr(hWnd), uintptr(hWndInsertAfter), uintptr(x), uintptr(y), uintptr(cx), uintptr(cy), uintptr(uFlags))
 	return r != 0
 }
 
 func GetWindowText(hWnd windows.HWND) string {
-	buff := make([]uint16, 255)
-	_, _, _ = getWindowText.Call(uintptr(hWnd), uintptr(unsafe.Pointer(&buff[0])), 255)
-	return syscall.UTF16ToString(buff)
+	count(cGetWindowText)
+	var buf [255]uint16
+	syscall.SyscallN(getWindowText.Addr(), uintptr(hWnd), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	return syscall.UTF16ToString(buf[:])
 }
 
 func GetWindowRect(hWnd windows.HWND, lpRect *Rect) bool {
-	r, _, _ := getWindowRect.Call(uintptr(hWnd), uintptr(unsafe.Pointer(lpRect)))
+	count(cGetWindowRect)
+	r, _, _ := syscall.SyscallN(getWindowRect.Addr(), uintptr(hWnd), uintptr(unsafe.Pointer(lpRect)))
 	return r != 0
 }
 
 func GetWindowStyle(hWnd windows.HWND) uintptr {
-	style, _, _ := getWindowLongPtr.Call(uintptr(hWnd), windowStyleIndexArg)
+	style, _, _ := syscall.SyscallN(getWindowLongPtr.Addr(), uintptr(hWnd), windowStyleIndexArg)
 	return style
 }
 
 func SetWindowStyle(hWnd windows.HWND, style uintptr) bool {
-	setWindowLongPtr.Call(uintptr(hWnd), windowStyleIndexArg, style)
+	syscall.SyscallN(setWindowLongPtr.Addr(), uintptr(hWnd), windowStyleIndexArg, style)
 	return GetWindowStyle(hWnd) == style
 }
 
 func IsWindow(hWnd windows.HWND) bool {
-	result, _, _ := isWindow.Call(uintptr(hWnd))
+	count(cIsWindow)
+	result, _, _ := syscall.SyscallN(isWindow.Addr(), uintptr(hWnd))
 	return result != 0
 }
 
 func IsWindowVisible(hWnd windows.HWND) bool {
-	result, _, _ := isWindowVisible.Call(uintptr(hWnd))
+	count(cIsWindowVisible)
+	result, _, _ := syscall.SyscallN(isWindowVisible.Addr(), uintptr(hWnd))
 	return result != 0
 }
 
 func IsZoomed(hWnd windows.HWND) bool {
-	result, _, _ := isZoomed.Call(uintptr(hWnd))
+	result, _, _ := syscall.SyscallN(isZoomed.Addr(), uintptr(hWnd))
 	return result != 0
 }
 
 func UpdateWindow(hWnd windows.HWND) bool {
-	ret, _, _ := updateWindow.Call(uintptr(hWnd))
+	count(cUpdateWindow)
+	ret, _, _ := syscall.SyscallN(updateWindow.Addr(), uintptr(hWnd))
 	return ret != 0
 }
 
 func SendMessage(hWd windows.HWND, msg uint32, wParam, lParam uintptr) uintptr {
-	r, _, _ := sendMessage.Call(uintptr(hWd), uintptr(msg), wParam, lParam)
+	count(cSendMessage)
+	r, _, _ := syscall.SyscallN(sendMessage.Addr(), uintptr(hWd), uintptr(msg), wParam, lParam)
 	return r
 }
 
 func GetWindowThreadProcessId(hWnd windows.HWND, dwProcessId *uint32) uint32 {
-	r, _, _ := getWindowThreadProcessId.Call(uintptr(hWnd), uintptr(unsafe.Pointer(dwProcessId)))
+	count(cGetWindowThreadProcessId)
+	r, _, _ := syscall.SyscallN(getWindowThreadProcessId.Addr(), uintptr(hWnd), uintptr(unsafe.Pointer(dwProcessId)))
 	return uint32(r)
 }
 
@@ -127,7 +139,8 @@ func MoveWindow(hWnd windows.HWND, x, y, width, height int32, repaint bool) bool
 	if repaint {
 		shouldRepaint = 1
 	}
-	r, _, _ := moveWindow.Call(
+	r, _, _ := syscall.SyscallN(
+		moveWindow.Addr(),
 		uintptr(hWnd),
 		uintptr(x),
 		uintptr(y),
@@ -142,7 +155,7 @@ func GetDpiForWindow(hWnd windows.HWND) uint32 {
 	if err := getDpiForWindow.Find(); err != nil {
 		return 0
 	}
-	dpi, _, _ := getDpiForWindow.Call(uintptr(hWnd))
+	dpi, _, _ := syscall.SyscallN(getDpiForWindow.Addr(), uintptr(hWnd))
 	return uint32(dpi)
 }
 
@@ -151,7 +164,7 @@ func SetWindowRgn(hWnd windows.HWND, region uintptr, redraw bool) bool {
 	if redraw {
 		shouldRedraw = 1
 	}
-	r, _, _ := setWindowRgn.Call(uintptr(hWnd), region, uintptr(shouldRedraw))
+	r, _, _ := syscall.SyscallN(setWindowRgn.Addr(), uintptr(hWnd), region, uintptr(shouldRedraw))
 	return r != 0
 }
 
@@ -162,7 +175,7 @@ func RefreshWindowFrame(hWnd windows.HWND) bool {
 
 func RedrawWindow(hWnd windows.HWND) bool {
 	const flags = 0x0001 | 0x0080 | 0x0100 | 0x0400
-	result, _, _ := redrawWindow.Call(uintptr(hWnd), 0, 0, flags)
+	result, _, _ := syscall.SyscallN(redrawWindow.Addr(), uintptr(hWnd), 0, 0, flags)
 	return result != 0
 }
 
@@ -170,12 +183,14 @@ func EnableThreadPerMonitorV2DpiAwareness() uintptr {
 	if err := setThreadDpiAwarenessContext.Find(); err != nil {
 		return 0
 	}
-	previousContext, _, _ := setThreadDpiAwarenessContext.Call(^uintptr(3))
+	count(cSetThreadDpiAwarenessContext)
+	previousContext, _, _ := syscall.SyscallN(setThreadDpiAwarenessContext.Addr(), ^uintptr(3))
 	return previousContext
 }
 
 func RestoreThreadDpiAwareness(previousContext uintptr) {
 	if previousContext != 0 {
-		setThreadDpiAwarenessContext.Call(previousContext)
+		count(cSetThreadDpiAwarenessContext)
+		syscall.SyscallN(setThreadDpiAwarenessContext.Addr(), previousContext)
 	}
 }

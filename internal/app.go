@@ -15,34 +15,58 @@ import (
 )
 
 const sleepTime = 100 * time.Millisecond
+// 500ms combined with the 5s snapshot pass measured 0.4% idle CPU, so the interval stays at 1000ms.
+const watchInterval = 1000 * time.Millisecond
+
+// snapshotEvery bounds how long a second instance can go undetected while a pid is already tracked.
+const snapshotEvery = 5 * time.Second
 const executable = "kakaotalk.exe"
+
+var executableBytes = []byte(executable)
 
 var mutex = &sync.Mutex{}
 var mainWindowHandleMap = make(map[windows.HWND]struct{})
 var adSubwindowCandidateMap = make(map[windows.HWND]struct{})
 var windowTextMap = make(map[windows.HWND]string)
 var windowClassMap = make(map[windows.HWND]string)
-var enumWindowCallbackMap = make(map[windows.HWND]uintptr)
 var customScrollHandleMap = make(map[windows.HWND]bool)
+var windowParentMap = make(map[windows.HWND]windows.HWND)
 
-func uint8ToStr(arr []uint8) string {
-	n := bytes.Index(arr, []uint8{0})
+// mainWindowRecheck bounds how stale a cached isMainWindow result may get.
+const mainWindowRecheck = time.Second
 
-	return string(arr[:n])
+type mainWindowState struct {
+	isMain    bool
+	checkedAt time.Time
 }
+
+var mainWindowStateMap = make(map[windows.HWND]mainWindowState)
+
+// lastSeen maps a target pid to any one of its windows, whatever the class.
+var lastSeen = make(map[uint32]windows.HWND)
+
+// childCollector is shared by every collectChildren call and is only touched
+// while mutex is held.
+var childCollector []windows.HWND
+var childCollectorCallback = syscall.NewCallback(func(handle windows.HWND, _ uintptr) uintptr {
+	childCollector = append(childCollector, handle)
+	return 1
+})
 
 func watch(ctx context.Context) {
 	var (
-		pe32      winapi.ProcessEntry32
-		szExeFile string
+		pe32 winapi.ProcessEntry32
 	)
 	pe32.DwSize = uint32(unsafe.Sizeof(pe32))
-	lastFoundAt := time.Now().Unix() - 2
 	var snapshot windows.HWND
+	// Declared outside the callback so &windowPid is not heap-allocated per window.
+	var windowPid uint32
 	var enumWindow = syscall.NewCallback(func(handle windows.HWND, processId uintptr) uintptr {
-		winapi.GetWindowThreadProcessId(handle, &pe32.Th32ProcessID)
-		if processId == uintptr(pe32.Th32ProcessID) {
-			lastFoundAt = time.Now().Unix()
+		winapi.GetWindowThreadProcessId(handle, &windowPid)
+		if processId == uintptr(windowPid) {
+			if _, ok := lastSeen[windowPid]; !ok {
+				lastSeen[windowPid] = handle
+			}
 			className := winapi.GetClassName(handle)
 			parentHandle := winapi.GetParent(handle)
 			beta.TrackWindow(handle, className, parentHandle)
@@ -67,8 +91,9 @@ func watch(ctx context.Context) {
 		}
 		return 1
 	})
-	ticker := time.NewTicker(sleepTime)
+	ticker := time.NewTicker(watchInterval)
 	defer ticker.Stop()
+	var lastSnapshot time.Time
 	// Closure, not `defer winapi.CloseHandle(snapshot)`: deferred arguments are
 	// evaluated immediately, which would capture the zero handle.
 	defer func() { winapi.CloseHandle(snapshot) }()
@@ -78,21 +103,36 @@ func watch(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			Mark("watch_tick")
 			mutex.Lock()
-			if lastFoundAt < time.Now().Unix()-1 {
-				// Release the previous snapshot before taking a new one.
-				// Without this every refresh leaks a kernel snapshot object,
-				// which happens roughly every 2s while KakaoTalk is not running.
-				winapi.CloseHandle(snapshot)
-				snapshot = winapi.CreateToolhelp32Snapshot(winapi.Th32csSnapprocess, 0)
-				lastFoundAt = time.Now().Unix()
+			for pid, hwnd := range lastSeen {
+				if !winapi.IsWindow(hwnd) {
+					delete(lastSeen, pid)
+				}
 			}
+			evictDeadWindows()
+			if len(lastSeen) > 0 && time.Since(lastSnapshot) < snapshotEvery {
+				for pid := range lastSeen {
+					winapi.EnumWindows(enumWindow, uintptr(pid))
+				}
+				mutex.Unlock()
+				continue
+			}
+			lastSnapshot = time.Now()
+			// Release the previous snapshot before taking a new one,
+			// otherwise every refresh leaks a kernel snapshot object.
+			winapi.CloseHandle(snapshot)
+			snapshot = winapi.CreateToolhelp32Snapshot(winapi.Th32csSnapprocess, 0)
 			if winapi.Process32First(uintptr(snapshot), &pe32) {
 				for {
-					szExeFile = uint8ToStr(pe32.SzExeFile[:])
+					name := pe32.SzExeFile[:]
+					if n := bytes.IndexByte(name, 0); n >= 0 {
+						name = name[:n]
+					}
 
-					if strings.ToLower(szExeFile) == executable || beta.IsExecutable(szExeFile) {
-						winapi.EnumWindows(enumWindow, uintptr(pe32.Th32ProcessID))
+					if bytes.EqualFold(name, executableBytes) || beta.IsExecutable(name) {
+						pid := pe32.Th32ProcessID
+						winapi.EnumWindows(enumWindow, uintptr(pid))
 					}
 
 					if !winapi.Process32Next(uintptr(snapshot), &pe32) {
@@ -100,9 +140,59 @@ func watch(ctx context.Context) {
 					}
 				}
 			}
+			winapi.CloseHandle(snapshot)
+			snapshot = 0
 			mutex.Unlock()
 		}
 	}
+}
+
+// windowLiveness is reused by every evictDeadWindows pass so the pass does not allocate.
+var windowLiveness = make(map[windows.HWND]bool)
+
+// evictDeadWindows drops handles of destroyed windows from the per-window
+// caches. The caller must hold mutex.
+func evictDeadWindows() {
+	clear(windowLiveness)
+	for h := range mainWindowHandleMap {
+		evictIfDead(h)
+	}
+	for h := range adSubwindowCandidateMap {
+		evictIfDead(h)
+	}
+	for h := range windowTextMap {
+		evictIfDead(h)
+	}
+	for h := range windowClassMap {
+		evictIfDead(h)
+	}
+	for h := range customScrollHandleMap {
+		evictIfDead(h)
+	}
+	for h := range mainWindowStateMap {
+		evictIfDead(h)
+	}
+	for h := range windowParentMap {
+		evictIfDead(h)
+	}
+}
+
+func evictIfDead(h windows.HWND) {
+	alive, checked := windowLiveness[h]
+	if !checked {
+		alive = winapi.IsWindow(h)
+		windowLiveness[h] = alive
+	}
+	if alive {
+		return
+	}
+	delete(mainWindowHandleMap, h)
+	delete(adSubwindowCandidateMap, h)
+	delete(windowTextMap, h)
+	delete(windowClassMap, h)
+	delete(customScrollHandleMap, h)
+	delete(mainWindowStateMap, h)
+	delete(windowParentMap, h)
 }
 
 func removeAd(ctx context.Context) {
@@ -116,54 +206,63 @@ func removeAd(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			Mark("removeAd_tick")
 			mutex.Lock()
+			now := time.Now()
+			var rect winapi.Rect
 			for wnd := range mainWindowHandleMap {
 				if wnd == 0 {
 					continue
 				}
-				childHandles = childHandles[:0]
-				var handle windows.HWND
-				enumWindow, ok := enumWindowCallbackMap[wnd]
-				if !ok {
-					enumWindow = syscall.NewCallback(func(handle windows.HWND, _ uintptr) uintptr {
-						childHandles = append(childHandles, handle)
-						return 1
-					})
-					enumWindowCallbackMap[wnd] = enumWindow
+				state, known := mainWindowStateMap[wnd]
+				fresh := known && now.Sub(state.checkedAt) < mainWindowRecheck
+				if fresh && !state.isMain {
+					continue
 				}
-				winapi.EnumChildWindows(wnd, enumWindow, uintptr(unsafe.Pointer(&handle)))
+				// Copy: classNameStartsWith below reuses the collector.
+				childHandles = append(childHandles[:0], collectChildren(wnd)...)
 
-				if !isMainWindow(childHandles) {
+				if !fresh {
+					state = mainWindowState{isMain: isMainWindow(childHandles), checkedAt: now}
+					mainWindowStateMap[wnd] = state
+				}
+				if !state.isMain || len(childHandles) == 0 {
 					continue
 				}
 
-				rect := new(winapi.Rect)
-				winapi.GetWindowRect(wnd, rect)
-				for _, childHandle := range childHandles[1:] {
+				rect = winapi.Rect{}
+				winapi.GetWindowRect(wnd, &rect)
+				for i, childHandle := range childHandles {
 					className := getWindowClass(childHandle)
 					windowText := getWindowText(childHandle)
-					parentHandle := winapi.GetParent(childHandle)
+					parentHandle := getWindowParent(childHandle)
 					if parentHandle != wnd {
 						continue
 					}
-					parentText := getWindowText(parentHandle)
-
-					if className == "EVA_ChildWindow" && windowText == "" && parentText != "" {
-						hasCustomScroll, ok := customScrollHandleMap[wnd]
-						if !ok {
-							hasCustomScroll = classNameStartsWith(childHandle, "_EVA_")
-							customScrollHandleMap[wnd] = hasCustomScroll
-						}
-						if !hasCustomScroll {
-							winapi.SendMessage(childHandle, winapi.WmClose, 0, 0)
+					// The top-most child is never sent WM_CLOSE (video playback window).
+					if i > 0 {
+						parentText := getWindowText(parentHandle)
+						if className == "EVA_ChildWindow" && windowText == "" && parentText != "" {
+							hasCustomScroll, ok := customScrollHandleMap[wnd]
+							if !ok {
+								hasCustomScroll = classNameStartsWith(childHandle, "_EVA_")
+								customScrollHandleMap[wnd] = hasCustomScroll
+							}
+							if !hasCustomScroll {
+								winapi.SendMessage(childHandle, winapi.WmClose, 0, 0)
+							}
 						}
 					}
-					HideMainViewAdArea(windowText, rect, childHandle)
-					HideLockScreenAdArea(windowText, rect, childHandle)
+					HideMainViewAdArea(windowText, &rect, childHandle)
+					HideLockScreenAdArea(windowText, &rect, childHandle)
 				}
 			}
 			for wnd := range adSubwindowCandidateMap {
+				if !winapi.IsWindowVisible(wnd) {
+					continue
+				}
 				if hasChromeLegacyWindow(wnd) {
+					markPopupHide(wnd)
 					winapi.ShowWindow(wnd, 0)
 				}
 			}
@@ -173,51 +272,36 @@ func removeAd(ctx context.Context) {
 	}
 }
 
+// collectChildren returns every descendant of parent. The slice is backed by
+// childCollector, so the next call overwrites it.
+func collectChildren(parent windows.HWND) []windows.HWND {
+	childCollector = childCollector[:0]
+	winapi.EnumChildWindows(parent, childCollectorCallback, 0)
+	return childCollector
+}
+
 func classNameStartsWith(handle windows.HWND, className string) bool {
-	childHandles := make([]windows.HWND, 0)
-
-	enumWindow, ok := enumWindowCallbackMap[handle]
-	if !ok {
-		enumWindow = syscall.NewCallback(func(handle windows.HWND, _ uintptr) uintptr {
-			childHandles = append(childHandles, handle)
-			return 1
-		})
-		enumWindowCallbackMap[handle] = enumWindow
+	if strings.HasPrefix(getWindowClass(handle), className) {
+		return true
 	}
-	winapi.EnumChildWindows(handle, enumWindow, uintptr(unsafe.Pointer(&handle)))
-
-	for _, wnd := range childHandles {
-		if classNameStartsWith(wnd, className) {
+	for _, wnd := range collectChildren(handle) {
+		if strings.HasPrefix(getWindowClass(wnd), className) {
 			return true
 		}
 	}
-
-	windowClass := getWindowClass(handle)
-	return strings.HasPrefix(windowClass, className)
+	return false
 }
 
 func hasChromeLegacyWindow(handle windows.HWND) bool {
-	childHandles := make([]windows.HWND, 0)
-
-	enumWindow, ok := enumWindowCallbackMap[handle]
-	if !ok {
-		enumWindow = syscall.NewCallback(func(handle windows.HWND, _ uintptr) uintptr {
-			childHandles = append(childHandles, handle)
-			return 1
-		})
-		enumWindowCallbackMap[handle] = enumWindow
+	if getWindowText(handle) == "Chrome Legacy Window" {
+		return true
 	}
-	winapi.EnumChildWindows(handle, enumWindow, uintptr(unsafe.Pointer(&handle)))
-
-	for _, wnd := range childHandles {
-		if hasChromeLegacyWindow(wnd) {
+	for _, wnd := range collectChildren(handle) {
+		if getWindowText(wnd) == "Chrome Legacy Window" {
 			return true
 		}
 	}
-
-	windowText := getWindowText(handle)
-	return windowText == "Chrome Legacy Window"
-
+	return false
 }
 
 func isMainWindow(handles []windows.HWND) bool {
@@ -242,6 +326,15 @@ func getWindowText(handle windows.HWND) string {
 		windowTextMap[handle] = text
 	}
 	return text
+}
+
+func getWindowParent(handle windows.HWND) windows.HWND {
+	parent, ok := windowParentMap[handle]
+	if !ok {
+		parent = winapi.GetParent(handle)
+		windowParentMap[handle] = parent
+	}
+	return parent
 }
 
 func getWindowClass(handle windows.HWND) string {

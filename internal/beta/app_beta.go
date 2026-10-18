@@ -1,6 +1,7 @@
 package beta
 
 import (
+	"bytes"
 	"kakaotalkadblock/internal/win/winapi"
 	"runtime"
 	"strings"
@@ -48,8 +49,10 @@ var childWindowCollectorCallback = syscall.NewCallback(func(handle windows.HWND,
 	return 1
 })
 
-func IsExecutable(name string) bool {
-	return strings.EqualFold(name, executable)
+var executableBytes = []byte(executable)
+
+func IsExecutable(name []byte) bool {
+	return bytes.EqualFold(name, executableBytes)
 }
 
 func TrackWindow(handle windows.HWND, className string, parentHandle windows.HWND) {
@@ -62,13 +65,16 @@ func TrackWindow(handle windows.HWND, className string, parentHandle windows.HWN
 }
 
 func RemoveAds() {
+	mutex.Lock()
+	defer mutex.Unlock()
+	if len(mainWindowHandleMap) == 0 {
+		return
+	}
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	previousDpiContext := winapi.EnableThreadPerMonitorV2DpiAwareness()
 	defer winapi.RestoreThreadDpiAwareness(previousDpiContext)
 
-	mutex.Lock()
-	defer mutex.Unlock()
 	for mainWindow := range mainWindowHandleMap {
 		if !winapi.IsWindow(mainWindow) {
 			delete(mainWindowHandleMap, mainWindow)
